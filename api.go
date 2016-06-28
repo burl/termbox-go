@@ -2,12 +2,17 @@
 
 package termbox
 
-import "github.com/mattn/go-runewidth"
-import "fmt"
-import "os"
-import "os/signal"
-import "syscall"
-import "runtime"
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+
+	"github.com/mattn/go-runewidth"
+)
+
+var viewPortMode = false
 
 // public API
 
@@ -69,16 +74,27 @@ func Init() error {
 		return err
 	}
 
-	out.WriteString(funcs[t_enter_ca])
+	if !viewPortMode {
+		out.WriteString(funcs[t_enter_ca])
+	}
 	out.WriteString(funcs[t_enter_keypad])
 	out.WriteString(funcs[t_hide_cursor])
-	out.WriteString(funcs[t_clear_screen])
+	if !viewPortMode {
+		out.WriteString(funcs[t_clear_screen])
+	}
 
 	termw, termh = get_term_size(out.Fd())
-	back_buffer.init(termw, termh)
-	front_buffer.init(termw, termh)
-	back_buffer.clear()
-	front_buffer.clear()
+	if !viewPortMode {
+		back_buffer.init(termw, termh)
+		front_buffer.init(termw, termh)
+		back_buffer.clear()
+		front_buffer.clear()
+	} else {
+		back_buffer.init(termw, termh)
+		front_buffer.init(termw, termh)
+		back_buffer.clear()
+		front_buffer.clear()
+	}
 
 	go func() {
 		buf := make([]byte, 128)
@@ -108,6 +124,46 @@ func Init() error {
 	return nil
 }
 
+// ViewPortInit - initialize termbox in "viewport mode"
+//
+// In Viewport mode, one draws into a screen-sized buffer the same
+// as full screen mode, but updates are flushed to teh terminal
+// as a rectangular region (of termw width and (n) lines) with FlushViewPort()
+//
+// Example:
+//
+//   termbox.ViewPortInit()
+//   termbox.SetCell(2, 2, 'X', termbox.ColorRed, termbox.ColorDefault)
+//   termbox.ViewPortSetHeight(3) // linesOut
+//   termbox.FlushViewPort()
+//
+// results in the terminal (at the current cursor position) doing the following:
+//   1. ViewPortSetHeight(3) makes sure that at least 3 lines are visible on
+//      the terminal below the current line - this is the "viewport"
+//   2. Flushes the clipping-window to those lines as the viewport.
+//      a) the clipping window origin is always 0,0 in the screen buffer
+//      b) the clipping window is alwasy the width of the terminal
+//      c) the clipping window y coordinate is the number of lines given
+//         in the ViewPortSetHeight() call
+//
+//  So, if your terminal is 5 columns by 10 lines and your run the above
+//  code when the cursor happens to be on line 3, the output would be like:
+//
+//  1 |bash$ ./run-program
+//  2 |
+//  3 |  X
+//  4 |bash$ _
+//  5 |
+//
+// If ViewPortSetHeight() is given a value that would exceed the number
+// of lines that remain on the screen, then the screen will be scrolled
+// the number of lines needed to fit.
+//
+func ViewPortInit() error {
+	viewPortMode = true
+	return Init()
+}
+
 // Interrupt an in-progress call to PollEvent by causing it to return
 // EventInterrupt.  Note that this function will block until the PollEvent
 // function has successfully been interrupted.
@@ -121,8 +177,10 @@ func Close() {
 	quit <- 1
 	out.WriteString(funcs[t_show_cursor])
 	out.WriteString(funcs[t_sgr0])
-	out.WriteString(funcs[t_clear_screen])
-	out.WriteString(funcs[t_exit_ca])
+	if !viewPortMode {
+		out.WriteString(funcs[t_clear_screen])
+		out.WriteString(funcs[t_exit_ca])
+	}
 	out.WriteString(funcs[t_exit_keypad])
 	out.WriteString(funcs[t_exit_mouse])
 	tcsetattr(out.Fd(), &orig_tios)
@@ -145,6 +203,93 @@ func Close() {
 	foreground = ColorDefault
 	background = ColorDefault
 	IsInit = false
+}
+
+// CuPos - cursor position report
+// TODO: this should use the outbuf, etc. - not fmt.Print()
+//
+func CuPos() (col, row int) {
+	fmt.Print("\033[6n")
+	data := make([]byte, 32)
+	PollRawEvent(data)
+	fmt.Sscanf(string(data), "\033[%d;%dR", &row, &col)
+	return
+}
+
+// ViewPortSetHeight - allocate n number of lines, returns current line on
+// the screen.
+// TODO: perhaps return a viewport object that knows the row, cursor position , etc.
+//
+func ViewPortSetHeight(n int) (y int) {
+
+	for i := 0; i < n-1; i++ {
+		fmt.Println("")
+	}
+	fmt.Printf("\033[%dA\033[J", n-1)
+	front_buffer.clear()
+	_, y = CuPos()
+	return
+}
+
+// ViewPortFlush - flush a rectangular region of the buffer to the current
+// screen location / ViewPort that was defined previously by calling
+// ViewPortSetLines()
+// This may be called over and over to continue updating the viewport
+// efficently, etc.
+//
+func ViewPortFlush(row, nRows, destRow int) error {
+	// invalidate cursor position
+	lastx = coord_invalid
+	lasty = coord_invalid
+
+	update_size_maybe()
+
+	for r := 0; r < nRows; r++ {
+		y := row + r
+		if y >= front_buffer.height {
+			break
+		}
+		line_offset := y * front_buffer.width
+		for x := 0; x < front_buffer.width; {
+			cell_offset := line_offset + x
+			back := &back_buffer.cells[cell_offset]
+			front := &front_buffer.cells[cell_offset]
+			if back.Ch < ' ' {
+				back.Ch = ' '
+			}
+			w := runewidth.RuneWidth(back.Ch)
+			if w == 0 || w == 2 && runewidth.IsAmbiguousWidth(back.Ch) {
+				w = 1
+			}
+			if *back == *front {
+				x += w
+				continue
+			}
+			*front = *back
+			send_attr(back.Fg, back.Bg)
+
+			if w == 2 && x == front_buffer.width-1 {
+				// there's not enough space for 2-cells rune,
+				// let's just put a space in there
+				send_char(x, r+destRow, ' ')
+			} else {
+				send_char(x, r+destRow, back.Ch)
+				if w == 2 {
+					next := cell_offset + 1
+					front_buffer.cells[next] = Cell{
+						Ch: 0,
+						Fg: back.Fg,
+						Bg: back.Bg,
+					}
+				}
+			}
+			x += w
+		}
+	}
+	if !is_cursor_hidden(cursor_x, cursor_y) {
+		write_cursor(cursor_x, cursor_y)
+	}
+	return flush()
 }
 
 // Synchronizes the internal back buffer with the terminal.
